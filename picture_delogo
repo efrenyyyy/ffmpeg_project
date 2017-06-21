@@ -1,0 +1,353 @@
+#if defined(WIN32) && !defined(__cplusplus)
+#define inline __inline
+#endif
+#include <stdio.h>
+#if WIN32
+#include <windows.h>
+#endif
+#define snprintf _snprintf
+#include <string>
+#include <vector>
+#include <iostream>
+#include <stdint.h>
+using namespace std;
+
+extern "C"
+{
+#include "libavutil/opt.h"
+#include "libavutil/time.h"
+#include "libavutil/mathematics.h"
+#include "libavutil/imgutils.h"
+#include "libavcodec/avcodec.h"
+#include "libavformat/avformat.h"
+#include "libavdevice/avdevice.h"
+#include "libswscale/swscale.h"
+#include "libavfilter/avfiltergraph.h"
+#include "libavfilter/buffersink.h"
+#include "libavfilter/buffersrc.h"
+}
+
+typedef struct PositionInfo{
+    std::string x;
+    std::string y;
+    std::string w;
+    std::string h;
+}PositionInfo;
+AVFilterContext *avfiltersrc_ctx;
+AVFilterContext *avfiltersink_ctx;
+AVFilterGraph *avfilter_graph = NULL;
+AVFilterInOut *outputs;
+AVFilterInOut *inputs;
+
+void split(std::string& s, const std::string& delim,std::vector< std::string >* ret)  
+{  
+    int start = 0;
+    int end = 0;
+    std::string str;
+    while (end != std::string::npos)
+    {
+        end = s.find_first_of(delim, start);
+        str = s.substr(start, end-start);
+        ret->push_back(str);
+        start = end+1;
+    }
+}
+
+void parse_parament(std::string &param, std::vector<PositionInfo> *ret)
+{
+    std::vector<std::string> tmp;
+    split(param, "|", &tmp);
+    while(tmp.size())
+    {
+        std::string str = tmp.back();
+        PositionInfo info;
+        std::vector<std::string> postion;
+        split(str, "_", &postion);
+        if (postion.size() != 4)
+        {
+            printf("param error %s\n", param.c_str());
+            return ;
+        }
+        info.h = postion.at(3);
+        info.w = postion.at(2);
+        info.y = postion.at(1);
+        info.x = postion.at(0);
+        tmp.pop_back();
+        ret->push_back(info);
+    }
+}
+
+int ffmpeg_vf_filter(AVFrame *pframe, AVFrame **outframe)
+{
+    int ret = 0;
+
+    if (ret = av_buffersrc_add_frame_flags(avfiltersrc_ctx, pframe,AV_BUFFERSRC_FLAG_PUSH) < 0)
+    {
+        return ret;
+    }
+
+    ret = av_buffersink_get_frame_flags(avfiltersink_ctx, *outframe,AV_BUFFERSINK_FLAG_NO_REQUEST);
+    if (ret < 0) {
+        if (ret != AVERROR(EAGAIN) && ret != AVERROR_EOF) {
+            av_log(NULL, AV_LOG_WARNING,
+                "Error in av_buffersink_get_frame_flags()\n");
+        } else if (ret == AVERROR_EOF) {
+            ret = 0;
+
+        }
+        ret = -1;
+
+    }
+
+    return ret;
+}
+
+
+static int ffmpeg_init_filter(vector<PositionInfo> &info, int w, int h)
+{
+    int ret = 0;
+    char args[1024] = {0};
+
+    avfilter_register_all();
+    avfilter_graph = avfilter_graph_alloc();
+    if (!avfilter_graph)
+    {
+        return -1;
+    }
+    AVFilter *buffersrc = avfilter_get_by_name("buffer");
+    AVFilter *buffersink = avfilter_get_by_name("buffersink");
+
+    //const char *filter_descr = "delogo=75:42:200:150:10,delogo=1400:20:450:200:10";
+    std::string filter_descr;
+    while(info.size())
+    {
+        PositionInfo pos = info.back();
+        filter_descr += "delogo=" + pos.x + ":" + pos.y + ":" + pos.w + ":" + pos.h + ":10";
+        info.pop_back();
+        if (info.size() > 0)
+        {
+            filter_descr += ",";
+        }
+    }
+    snprintf(args, sizeof(args), "video_size=%dx%d:pix_fmt=0:time_base=1/1000:pixel_aspect=0/1:sws_param=flags=2:frame_rate=25/1", w, h);
+
+    avfilter_graph->scale_sws_opts = av_strdup("flags=bicubic");
+
+    if ((ret = avfilter_graph_parse2(avfilter_graph, filter_descr.c_str(), &inputs, &outputs)) < 0)
+        return ret;
+
+    AVFilterInOut *cur;
+    int i = 0;
+    for (cur = inputs, i; cur; cur = cur->next, i++)
+    {
+        ret = avfilter_graph_create_filter(&avfiltersrc_ctx, buffersrc, "in", args, NULL, avfilter_graph);
+        if (ret < 0)
+        {
+            av_log(NULL, AV_LOG_ERROR, "cannot create buffer source\n");
+            goto end;
+        }
+        AVFilterContext *last_filter = avfiltersrc_ctx;
+        avfilter_link(last_filter, 0, cur->filter_ctx, cur->pad_idx);
+        last_filter = cur->filter_ctx;
+    }
+
+    for (cur = outputs, i; cur; cur = cur->next, i++)
+    {
+        ret = avfilter_graph_create_filter(&avfiltersink_ctx, buffersink, "out", NULL, NULL, avfilter_graph);
+        if (ret < 0)
+        {
+            av_log(NULL, AV_LOG_ERROR, "cannot create buffer source\n");
+            goto end;
+        }
+        AVFilterContext *last_filter = outputs->filter_ctx;;
+        ret = avfilter_link(last_filter, outputs->pad_idx, avfiltersink_ctx, 0);
+        if (ret < 0)
+        {
+            return ret;
+        }
+    }
+    if (ret = avfilter_graph_config(avfilter_graph, NULL) < 0)
+    {
+        return ret;
+    }
+end:
+    return 0;
+}
+
+int main(int argc, char **args)
+{
+    AVFormatContext *ifmt_ctx, *ofmt_ctx;
+    AVCodecContext *codec_ctx, *encode_ctx;
+    AVCodec *codec, *encode;
+    AVPacket *dec_pkt, *enc_pkt;
+    AVFrame *enc_frame;
+    AVFrame *dec_frame;
+    AVInputFormat *fmt;
+    char *src_name, *dst_name;
+    std::string param;
+    std::vector<PositionInfo> position_vector;
+    int got_picture;
+    int video_index = -1;
+
+    if (argc < 4)
+    {
+        printf("param error, useage [input output param] running\n");
+        return -1;
+    }
+    src_name = args[1];
+    dst_name = args[2];
+    param = args[3];
+    parse_parament(param, &position_vector);
+
+    av_register_all();
+    avcodec_register_all();
+    av_log_set_level(AV_LOG_TRACE);
+    ifmt_ctx = avformat_alloc_context();
+    if (!ifmt_ctx)
+    {
+        printf("avformat_alloc_context error\n");
+        return -1;
+    }
+    avformat_alloc_output_context2(&ofmt_ctx, NULL, "mjpeg", dst_name);
+    if (!ofmt_ctx)
+    {
+        printf("avformat_alloc_output_context2 error\n");
+        return -1;
+    }
+    ofmt_ctx->oformat->video_codec = CODEC_ID_MJPEG;
+
+    fmt = av_find_input_format("mjpeg");
+    if (avformat_open_input(&ifmt_ctx, src_name, fmt, NULL) < 0)
+    {
+        printf("avformat_open_input error\n");
+        return -1;
+    }
+    if (avformat_find_stream_info(ifmt_ctx, NULL) < 0)
+    {
+        printf("avformat_find_stream_info error\n");
+        return -1;
+    }
+    for (size_t i = 0; i < ifmt_ctx->nb_streams; i++)
+    {
+        if (ifmt_ctx->streams[i]->codec->codec_type == AVMEDIA_TYPE_VIDEO)
+        {
+            video_index = i;
+            continue;
+        }
+    }
+
+    AVStream *st = avformat_new_stream(ofmt_ctx, NULL);
+    if (!st)
+    {
+        printf("avformat_new_stream error\n");
+        return -1;
+    }
+    ofmt_ctx->streams[video_index]->codec = st->codec;
+    codec_ctx = ifmt_ctx->streams[video_index]->codec;
+    encode_ctx = ofmt_ctx->streams[video_index]->codec;
+    encode_ctx->codec_id = codec_ctx->codec_id;
+    encode_ctx->pix_fmt = codec_ctx->pix_fmt;
+    encode_ctx->width = codec_ctx->width;
+    encode_ctx->height = codec_ctx->height;
+    encode_ctx->coded_height = codec_ctx->coded_height;
+    encode_ctx->coded_width = codec_ctx->coded_width;
+    encode_ctx->codec_type = codec_ctx->codec_type;
+    encode_ctx->framerate = codec_ctx->framerate;
+    encode_ctx->gop_size = codec_ctx->gop_size;
+    encode_ctx->time_base = codec_ctx->time_base;
+    enc_frame = av_frame_alloc();
+    if (!enc_frame)
+    {
+        printf("av_frame_alloc enc error\n");
+        return -1;
+    }
+    dec_frame = av_frame_alloc();
+    if (!dec_frame)
+    {
+        printf("av_frame_alloc dec error\n");
+        return -1;
+    }
+
+    dec_pkt = (AVPacket *)av_malloc(sizeof(AVPacket));
+    av_init_packet(dec_pkt);
+    enc_pkt = (AVPacket *)av_malloc(sizeof(AVPacket));
+    av_init_packet(enc_pkt);
+    enc_pkt->data = NULL;
+    enc_pkt->size = 0;
+    codec = avcodec_find_decoder(codec_ctx->codec_id);
+    if (!codec)
+    {
+        printf("avcodec_find_decoder codec error\n");
+        return -1;
+    }
+    encode = avcodec_find_encoder(encode_ctx->codec_id);
+    if (!encode)
+    {
+        printf("avcodec_find_decoder encode error\n");
+        return -1;
+    }
+    if (avcodec_open2(codec_ctx, codec, NULL) < 0)
+    {
+        printf("avcodec_open2 codec error\n");
+        return -1;
+    }
+    if (avcodec_open2(encode_ctx, encode, NULL) < 0)
+    {
+        printf("avcodec_open2 encode error\n");
+        return -1;
+    }
+    avio_open2(&ofmt_ctx->pb, dst_name, AVIO_FLAG_WRITE, NULL, NULL);
+
+    ffmpeg_init_filter(position_vector, encode_ctx->width, encode_ctx->height);
+
+    avformat_write_header(ofmt_ctx, NULL);
+    while (av_read_frame(ifmt_ctx, dec_pkt) >= 0)
+    {
+        if (dec_pkt->stream_index != video_index)
+        {
+            av_free_packet(dec_pkt);
+            continue;
+        }
+
+        if (dec_pkt->flags&AV_PKT_FLAG_KEY)
+        {
+            printf("key frame");
+        }
+
+        if (avcodec_decode_video2(codec_ctx, dec_frame, &got_picture, dec_pkt) < 0)
+        {
+            av_free_packet(dec_pkt);
+            printf("decode video error, the pkt size is %d\n", dec_pkt->size);
+            continue;
+        }
+
+        if (got_picture)
+        {
+            int got_packet = 0;
+            ffmpeg_vf_filter(dec_frame, &enc_frame);
+            avcodec_encode_video2(encode_ctx, enc_pkt, enc_frame, &got_packet);
+            if (got_packet)
+            {
+                av_write_frame(ofmt_ctx, enc_pkt);
+            }
+        }
+        else
+        {
+            printf("frame size:%d, null frame return\n", dec_pkt->size);
+
+        }
+        av_free_packet(dec_pkt);
+        av_free_packet(enc_pkt);
+    }
+    av_write_trailer(ofmt_ctx);
+
+    av_frame_free(&dec_frame);
+    av_frame_free(&enc_frame);
+    av_free(dec_pkt);
+    av_free(enc_pkt);
+    avfilter_graph_free(&avfilter_graph);
+    avformat_free_context(ifmt_ctx);
+    avformat_free_context(ofmt_ctx);
+    inputs = NULL;
+    outputs = NULL;
+}
