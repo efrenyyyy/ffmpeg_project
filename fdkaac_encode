@@ -1,0 +1,222 @@
+#include <stdint.h>
+#include <memory.h>
+#include <stdio.h>
+#include <errno.h>
+#include <malloc.h>
+#include <stdlib.h>
+#include "aacenc_encoder.h"
+#include "aacenc_lib.h"
+#include "lpcm_encoder.h"
+#include "rtp_sender.h"
+
+using namespace pps::audiosdk;
+#define MAX_RTP_LENGTH 1450
+
+enum eSSRC{
+    RTP_SSRC_AAC    =   0x4fabc890,
+    RTP_SSRC_PCM    =   0x4fabc891,
+};
+
+enum ePayload{
+    RTP_PAYLOAD_AAC =   97,
+    RTP_PAYLOAD_PCM =   98,
+};
+
+typedef struct RTP_Header_t 
+{ 
+    uint16_t csrc_count:4; 
+    uint16_t extension:1; 
+    uint16_t padding:1; 
+    uint16_t version:2; 
+    uint16_t payloadtype:7; 
+    uint16_t marker:1; 
+    uint16_t seq; 
+    uint32_t timestamp; 
+    uint32_t ssrc; 
+}RTP_Header;
+
+typedef struct RTP_Packet_t
+{
+    RTP_Header rtp_header;
+    uint8_t data[MAX_RTP_LENGTH];
+}RTP_Packet;
+
+RTP_Packet *aac_wrap_rtp(RTP_Packet **rtps, uint8_t *buf, uint16_t length, uint32_t timestamp, uint16_t sequence, uint16_t *got_rtp, uint32_t *rtp_size)
+{
+    static uint32_t cur_pos = 0;
+    static uint16_t count = 0;
+    RTP_Packet *rtp = *rtps;
+
+    count ++;
+    *got_rtp = 0;
+    if (cur_pos && length + cur_pos < MAX_RTP_LENGTH && count < 10)
+    {
+        memcpy(rtp->data + cur_pos, buf, length);
+        cur_pos += length;
+    }
+    else if (!cur_pos && length + cur_pos < MAX_RTP_LENGTH && count < 10)
+    {
+        memcpy(rtp->data + cur_pos, buf, length);
+        cur_pos += length;
+        rtp->rtp_header.version = 2;
+        rtp->rtp_header.padding = 0;
+        rtp->rtp_header.extension = 0;
+        rtp->rtp_header.csrc_count = 0;
+        rtp->rtp_header.marker = 1;
+        rtp->rtp_header.payloadtype = RTP_PAYLOAD_AAC;
+        rtp->rtp_header.seq = sequence;
+        rtp->rtp_header.timestamp = timestamp;
+        rtp->rtp_header.ssrc = RTP_SSRC_AAC;
+    }
+    else if ((length + cur_pos > MAX_RTP_LENGTH) || count == 10)
+    {
+        //TODO send rtp packet 
+        rtp = rtps[1];
+        rtp->rtp_header.version = rtps[0]->rtp_header.version;
+        rtp->rtp_header.padding = rtps[0]->rtp_header.padding;
+        rtp->rtp_header.extension = rtps[0]->rtp_header.csrc_count;
+        rtp->rtp_header.ssrc = rtps[0]->rtp_header.ssrc;
+        rtp->rtp_header.marker = rtps[0]->rtp_header.marker;
+        rtp->rtp_header.payloadtype = rtps[0]->rtp_header.payloadtype;
+        rtp->rtp_header.seq = rtps[0]->rtp_header.seq;
+        rtp->rtp_header.timestamp = rtps[0]->rtp_header.timestamp;
+        memcpy(rtp->data, rtps[0]->data, cur_pos);
+        *rtp_size = cur_pos + sizeof(RTP_Header);
+        cur_pos = 0;
+        count = 1;
+        *got_rtp = 1;
+
+        memcpy(rtps[0]->data + cur_pos, buf, length);
+        cur_pos += length;
+        rtps[0]->rtp_header.version = 2;
+        rtps[0]->rtp_header.padding = 0;
+        rtps[0]->rtp_header.extension = 0;
+        rtps[0]->rtp_header.csrc_count = 0;
+        rtps[0]->rtp_header.marker = 1;
+        rtps[0]->rtp_header.payloadtype = RTP_PAYLOAD_AAC;
+        rtps[0]->rtp_header.seq = sequence;
+        rtps[0]->rtp_header.timestamp = timestamp;
+        rtps[0]->rtp_header.ssrc = RTP_SSRC_AAC;
+        printf("this is a new rtp packet total %d frame size %d\n", cur_pos, length);
+    }
+    printf("cur frame %d, total %d count %d\n", length, cur_pos, count);
+    return rtp;
+}
+
+aacenc_param_t aacenc_set_parament(aacenc_param_t parament)
+{
+    parament.bitrate = 32000;
+    parament.profile = AOT_AAC_LC;
+    parament.bitrate_mode = 0;
+    parament.bandwidth = 0;         //AAC-LC only
+    parament.afterburner = 0;
+    parament.adts_crc_check = 1;    //add crc protection on adts header
+    parament.header_period = 0;     //StreamMuxConfig repetition period in transportlay
+    parament.lowdelay_sbr = 1;
+    parament.sbr_ratio = 0;         //0 default,1 downsampled sbr(default for ELD-SBR),2 dual-rate SBR(default for HE)
+    parament.sbr_signaling = 0;
+    parament.transport_format = 2;  //2 adts
+    return parament;
+}
+
+void main(int argc, char **argv)
+{
+    HANDLE_AACENCODER encoder;
+    AACENC_InfoStruct info;
+    aacenc_param_t parament = {0};
+    pcm_sample_description_t format;
+    aacenc_frame_t aacframe;
+    RTP_Packet *rtp_packets[2], *rtp_packet;
+    uint32_t timestamp = 0;
+    float duration;
+    uint16_t sequence = 0;
+    uint16_t got_rtp = 0;
+    FILE *ofp, *ifp;
+    int32_t samples = 0;
+    uint32_t length = 0, size, framesize = 0, rtp_size;
+    uint8_t ret = 0;
+    uint8_t buffer[4096] = {0};
+    char *input, *output;
+
+    if (argc < 3)
+    {
+        printf("please input <input> <output>\n");
+        return ;
+    }
+    input = argv[1];
+    output = argv[2];
+    RTP_Sender rtp_sender;
+    rtp_sender.start("10.5.16.47", 6090);
+    format.sample_type = PCM_TYPE_SINT;
+    format.sample_rate = 44100;
+    format.bits_per_channel = 16;
+    format.channels_per_frame = 2;
+    format.bytes_per_frame = format.channels_per_frame * ((format.bits_per_channel + 7) / 8);
+    format.channel_mask = 0;
+    memset(&parament, 0, sizeof(parament));
+    parament = aacenc_set_parament(parament);
+    ret = aacenc_init(&encoder, &parament, &format, &info);
+    if (ret)
+    {
+        printf("aacenc init error!\n");
+        return ;
+    }
+    rtp_packets[0] = (RTP_Packet *)malloc(sizeof(RTP_Packet));
+    rtp_packets[1] = (RTP_Packet *)malloc(sizeof(RTP_Packet));
+    ifp = fopen(input, "rb");
+    printf("error %d\n", errno);
+    fseek(ifp, 0, SEEK_END);
+    size = ftell(ifp);
+    fseek(ifp, 0, SEEK_SET);
+    ofp = fopen(output, "wb");
+    duration = (float)1024/44.1;
+    while (1)
+    {
+        ret = fread(buffer, sizeof(uint8_t), 4096, ifp);
+        if (ret < 0)
+        {
+            printf("error %d\n", ftell(ifp));
+            break;
+        }
+        length += 4096;
+        memset(&aacframe, 0, sizeof(aacframe));
+        samples = aac_encode_frame(encoder, &format, (const int16_t *)buffer, 1024, &aacframe);
+        if (samples < 0 || (!aacframe.size && !samples))
+        {
+            printf("samples:%d, frame size:%d\n", samples, aacframe.size);
+            break;
+        }
+        if (samples && !aacframe.size)
+        {
+            continue;
+        }
+        memcpy(buffer, aacframe.data, aacframe.size);
+        ret = fwrite(buffer, sizeof(uint8_t), aacframe.size, ofp);
+        if (ret != aacframe.size)
+        {
+            printf("write frame length %d frame size %d errno %d\n", ret, aacframe.size, errno);
+            //break;
+        }
+        framesize += aacframe.size;
+        //printf("writen size %d total frame size %d cur frame %d\n", ftell(ofp), framesize, aacframe.size);
+
+        sequence ++;
+        timestamp += (uint32_t)((duration*10 + 4)/10);
+        rtp_packet = aac_wrap_rtp(rtp_packets, aacframe.data, aacframe.size, timestamp, sequence, &got_rtp, &rtp_size);
+        if (got_rtp)
+        {
+            //TODO send rtp_packet  size rtp_size
+            rtp_sender.write((boost::uint8_t *)rtp_packet, rtp_size);
+        }
+
+        if (size <= length)
+            break;
+    }
+
+    rtp_sender.stop();
+    free(rtp_packets[0]);
+    free(rtp_packets[1]);
+    fclose(ofp);
+    fclose(ifp);
+    aacEncClose(&encoder);
+}
